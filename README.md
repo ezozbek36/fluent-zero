@@ -18,12 +18,12 @@ In an immediate-mode GUI (like `egui`) running at 60 FPS, looking up 50 strings 
 
 **`fluent-zero` solves this by pre-computing the cache at compile time.**
 
-| Feature | `fluent-templates` | `fluent-zero` |
-| --- | --- | --- |
+| Feature                | `fluent-templates`         | `fluent-zero`                        |
+| ---------------------- | -------------------------- | ------------------------------------ |
 | **Static Text Lookup** | Heap Allocation (`String`) | **Zero Allocation** (`&'static str`) |
-| **Lookup Speed** | HashMap + AST traversal | **Perfect Hash Function (PHF)** |
-| **Memory Usage** | Full AST loaded on start | **Lazy / Zero-Cost Abstraction** |
-| **Best For** | Web Servers (Tera/Askama) | **Desktop GUIs & Games** |
+| **Lookup Speed**       | HashMap + AST traversal    | **Perfect Hash Function (PHF)**      |
+| **Memory Usage**       | Full AST loaded on start   | **Lazy / Zero-Cost Abstraction**     |
+| **Best For**           | Web Servers (Tera/Askama)  | **Desktop GUIs & Games**             |
 
 ## 🚀 Usage
 
@@ -60,12 +60,10 @@ assets/
 Configure the code generator to read your locales directory. This will generate the static PHF maps and Rust code required for the zero-allocation cache inside your `OUT_DIR`.
 
 ```rust
-// build.rs
 fn main() {
     // Generates static_cache.rs in your OUT_DIR
     fluent_zero_build::generate_static_cache("assets/locales");
 }
-
 ```
 
 ### 4. Application Code
@@ -84,66 +82,175 @@ fn main() {
     set_lang("fr-FR".parse().expect("Invalid lang ID"));
 
     // 3. Use the t! macro for lookups.
-    
+
     // CASE A: Static String
     // Returns &'static str. ZERO ALLOCATION.
-    let title = t!("app-title"); 
-    
+    let title = t!("app-title");
+
     // CASE B: Dynamic String (with variables)
     // Returns Cow<'static, str>. Allocates only if variables are resolved.
-    let welcome = t!("welcome-user", { 
+    let welcome = t!("welcome-user", {
         "name" => "Alice",
-        "unread_count" => 5 
+        "unread_count" => 5
     });
-    
+
     println!("{}", title);
     println!("{}", welcome);
 }
-
 ```
 
 ## 📦 Library Support & Nested Translations
 
 `fluent-zero` supports a modular architecture where libraries and dependencies manage their own translations independently, but share their end results with the caller.
 
-If you are writing a library (e.g., a widget crate or a game engine plugin), you can include `fluent-zero-build` in your library's `build.rs`. Your library will generate its own private `CACHE` and `LOCALES` maps based on its own `.ftl` files, and your callers will automatically receive those translations via your normal APIs based on the set global language.
+While the **translation data** is isolated per crate (compile-time), the **language selection** is global (runtime). When your application calls `fluent_zero::set_lang("fr-FR")`, all UI plugins, logging dependencies, and nested widgets will instantly switch contexts without manual propagation.
 
-### Global Synchronization
+---
 
-While the **translation data** is isolated per crate (compile-time), the **language selection** is global (runtime).
+## 🔠 Enterprise Font Subsetting (DAG IPC)
 
-* **`fluent_zero::set_lang(...)`**: Updates the language for the **entire application stack**.
-* **`t!(...)`**: Uses the library-specific translation files but respects the globally set language.
+When deploying to environments (like WASM or games) that bundle custom fonts, you must reliably compute the unique characters used across **all your dependencies** to prevent missing glyphs at runtime.
 
-This allows for a cohesive ecosystem where the end-user application sets the language once, and all dependencies (UI widgets, logging, error messages) switch context instantly without manual propagation.
+`fluent-zero` achieves this with a hermetic, build-system-agnostic pipeline (100% compatible with `sccache`, `Bazel`, and `Nix`). It utilizes Cargo's native IPC (Inter-Package Communication) via the DAG to safely bubble up characters from dependencies without requiring brittle `cargo_metadata` JSON scraping or workspace directory-walking.
 
-```text
-my-app/
-├── Cargo.toml
-├── build.rs             // Generates app-specific cache
-├── assets/locales/      // Contains "welcome-screen.ftl"
-└── src/main.rs          // Calls set_lang("fr-FR")
+### Step 1: Opt-in your Dependencies
 
-my-ui-library/ (Dependency)
-├── Cargo.toml
-├── build.rs             // Generates library-specific cache
-├── assets/locales/      // Contains "ok-button.ftl", "cancel.ftl"
-└── src/lib.rs           // Calls t!("ok-button")
+For Cargo to authorize data bubbling up to your main application, any UI dependency or plugin using `fluent-zero` must declare a **globally unique** `links` key in its `Cargo.toml`.
 
+```toml
+[package]
+name = "my-ui-library"
+version = "0.1.0"
+links = "my_ui_library" # <-- **REQUIRED FOR IPC BUBBLING**
 ```
 
-In this example, when `my-app` calls `set_lang("fr-FR")`, the `my-ui-library` automatically begins serving French strings for its internal components.
+### Step 2: Configure the Application `build.rs`
+
+In your top-level application, configure `fluent-zero-build` to export the charset. The builder will automatically read the injected IPC variables from Cargo (`DEP_<LINKS>_FLUENT_CHARSET_PATH`) and merge all dependency characters into a single master file.
+
+```rust
+use std::{env, path::Path, process::Command};
+
+use anyhow::Context as _;
+
+fn main() -> anyhow::Result<()> {
+    let out_dir = env::var("OUT_DIR").context("OUT_DIR environment variable not set")?;
+    let out_dir_path = Path::new(&out_dir);
+    let charset_path = out_dir_path.join("fluent_chars.txt");
+
+    // 1. Enterprise Dependency Aggregation via Cargo IPC
+    // The builder natively aggregates character sets exposed by dependencies.
+    fluent_zero_build::FluentZeroBuilder::new("assets/locales")
+        .export_charset(&charset_path)
+        .generate();
+
+    // 2. Run the Python Subsetter securely locked inside the OUT_DIR phase
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").context("CARGO_MANIFEST_DIR not set")?;
+    let script_path = Path::new(&manifest_dir).join("scripts/subset_fonts.py");
+    let fonts_dir = Path::new(&manifest_dir).join("assets/fonts");
+
+    let status = Command::new("python3")
+        .arg(&script_path)
+        .arg(&charset_path)
+        .arg(&fonts_dir)
+        .arg(out_dir_path)
+        .status()
+        .context("Failed to execute python subsetting script")?;
+
+    anyhow::ensure!(
+        status.success(),
+        "Python font subsetting failed with exit status: {status}"
+    );
+
+    // Tell Cargo to re-run this script if fonts or scripts change
+    println!("cargo:rerun-if-changed={}", fonts_dir.display());
+    println!("cargo:rerun-if-changed={}", script_path.display());
+
+    Ok(())
+}
+```
+
+### Step 3: The Python Subsetter Script
+
+You will need the `fonttools` library (`pip install fonttools`) to strip out unneeded glyphs. Place this production-ready script in `scripts/subset_fonts.py`.
+
+```python
+#!/usr/bin/env python3
+import sys
+import subprocess
+from pathlib import Path
+
+def main():
+    if len(sys.argv) != 4:
+        print("Usage: subset_fonts.py <charset_path> <fonts_dir> <out_dir>")
+        sys.exit(1)
+
+    charset_path = Path(sys.argv[1]).resolve()
+    fonts_dir = Path(sys.argv[2]).resolve()
+    out_dir = Path(sys.argv[3]).resolve()
+
+    if not charset_path.exists():
+        sys.exit(f"Error: Charset file not found at {charset_path}")
+
+    # Read the unified character set
+    text = charset_path.read_text(encoding="utf-8")
+
+    # Enterprise Safety: Always include basic ASCII (32-126) for debug text and fallbacks
+    basic_ascii = "".join(chr(i) for i in range(32, 127))
+    master_text = text + basic_ascii
+
+    # Write out a temporary file for pyftsubset to consume safely
+    out_dir.mkdir(parents=True, exist_ok=True)
+    temp_text_path = out_dir / "subset_target.txt"
+    temp_text_path.write_text(master_text, encoding="utf-8")
+
+    # Iterate and subset all fonts in the directory
+    for font_file in fonts_dir.glob("*.ttf"):
+        out_font = out_dir / font_file.name
+
+        # pyftsubset CLI arguments for safe GUI subsetting
+        args = [
+            "pyftsubset",
+            str(font_file),
+            f"--text-file={temp_text_path}",
+            f"--output-file={out_font}",
+            "--layout-features=*",
+            "--glyph-names",
+            "--symbol-cmap",
+            "--legacy-cmap",
+            "--notdef-glyph",
+            "--notdef-outline",
+            "--recommended-glyphs",
+            "--name-IDs=*",
+            "--name-legacy",
+            "--name-languages=*",
+            "--desubroutinize"
+        ]
+
+        print(f"Subsetting {font_file.name} -> {out_font.name}...")
+        subprocess.run(args, check=True)
+
+if __name__ == "__main__":
+    main()
+```
+
+Your optimized `.ttf` files are now securely located in `OUT_DIR` and can be seamlessly embedded into your binary using `include_bytes!(concat!(env!("OUT_DIR"), "/my_font.ttf"))`.
+
+---
 
 ## 🧠 How it Works
 
 1. **Build Time**: `fluent-zero-build` scans your `.ftl` files. It identifies which messages are purely static (no variables) and which are dynamic.
 2. **Code Gen**: It generates a Rust module containing **Perfect Hash Maps** (via `phf`) for every locale.
-* Static messages are compiled directly into the binary's read-only data section (`.rodata`).
-* Dynamic messages are stored as raw FTL strings, wrapped in `LazyLock`.
+
+- Static messages are compiled directly into the binary's read-only data section (`.rodata`).
+- Dynamic messages are stored as raw FTL strings, wrapped in `LazyLock`.
+
 3. **Run Time**:
-* When you call `t!("hello")`, `fluent-zero` checks the PHF map.
-* If it finds a static entry, it returns a reference to the binary data instantly. **No parsing. No allocation.**
-* If it finds a dynamic entry, it initializes the heavy `FluentBundle` (only once) and performs the variable substitution.
+
+- When you call `t!("hello")`, `fluent-zero` checks the PHF map.
+- If it finds a static entry, it returns a reference to the binary data instantly. **No parsing. No allocation.**
+- If it finds a dynamic entry, it initializes the heavy `FluentBundle` (only once) and performs the variable substitution.
 
 ## 🛠️ Example: using with `egui`
 
@@ -156,19 +263,18 @@ impl eframe::App for MyApp {
             // These calls are effectively free (nanoseconds).
             // They do not allocate memory.
             ui.heading(t!("menu_title"));
-            
+
             if ui.button(t!("btn_submit")).clicked() {
                 // ...
             }
-            
+
             // Only this allocates, and only when 'count' changes if the UI is smart
-            ui.label(t!("items_remaining", { 
-                "count" => self.items.len() 
+            ui.label(t!("items_remaining", {
+                "count" => self.items.len()
             }));
         });
     }
 }
-
 ```
 
 ## ⚠️ Trade-offs

@@ -201,3 +201,15 @@ fn t08_verify_zero_copy_pointer_address() {
         panic!("Expected Borrowed result");
     }
 }
+
+#[test]
+fn t09_verify_charset_merging() {
+    let app_charset = "abc😀";
+    let dep_charset = "cde";
+    let ui_charset = "zxa";
+
+    let merged = fluent_zero::join_charsets(&[app_charset, dep_charset, ui_charset]);
+
+    // Ensure it deduplicated successfully, included emoji, and deterministically sorted via BTreeSet.
+    assert_eq!(merged, "abcdexz😀");
+}

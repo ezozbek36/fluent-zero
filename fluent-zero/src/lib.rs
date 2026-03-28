@@ -48,7 +48,7 @@ pub struct LocaleState {
     /// The parsed identifier (e.g., `en-US`).
     _id: LanguageIdentifier,
     /// The string representation used for cache keys (e.g., "en-US").
-    key: String,
+    pub key: String,
 }
 
 /// The global thread-safe storage for the current language.
@@ -129,6 +129,88 @@ impl<S: BuildHasher + Sync + Send> BundleCollection
     }
 }
 
+/// Merges multiple charset strings into a single, deduplicated, and sorted string.
+///
+/// This function provides an enterprise-quality, build-system agnostic solution for
+/// aggregating characters for font subsetting. By combining the `CHARSET` constants
+/// generated natively by `fluent-zero-build` from your application and all its
+/// dependencies, you seamlessly compute a master charset without brittle `cargo_metadata`
+/// scripts or violating Cargo's `OUT_DIR` sandboxing limits.
+///
+/// # Arguments
+///
+/// * `charsets` - A slice of `&str` references, typically pointing to `crate::CHARSET`.
+///
+/// # Returns
+///
+/// A deterministically sorted `String` containing every unique character.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let complete_charset = fluent_zero::join_charsets(&[
+///     crate::CHARSET,
+///     my_ui_lib::CHARSET,
+/// ]);
+/// std::fs::write("target/font_charset.txt", complete_charset).unwrap();
+/// ```
+#[must_use]
+pub fn join_charsets(charsets: &[&str]) -> String {
+    let mut unique_chars = std::collections::BTreeSet::new();
+    for charset in charsets {
+        unique_chars.extend(charset.chars());
+    }
+    unique_chars.into_iter().collect()
+}
+
+/// Core internal helper resolving entries efficiently, eliminating fallback duplicate closures.
+#[inline]
+fn resolve_entry<'a, B: BundleCollection + ?Sized, C: CacheStore + ?Sized>(
+    bundles: &'a B,
+    cache: &C,
+    lang: &str,
+    key: &'a str,
+    args: Option<&FluentArgs>,
+) -> Option<Cow<'a, str>> {
+    match cache.get_entry(lang, key)? {
+        CacheEntry::Static(s) => Some(Cow::Borrowed(s)),
+        CacheEntry::Dynamic => {
+            let bundle = bundles.get_bundle(lang)?;
+            let msg = bundle.get_message(key)?;
+            let pattern = msg.value()?;
+            let mut errors = vec![];
+            Some(bundle.format_pattern(pattern, args, &mut errors))
+        }
+    }
+}
+
+/// Abstracted O(1) cascade matching the runtime environment language against established caches.
+#[inline]
+fn lookup_core<'a, B: BundleCollection + ?Sized, C: CacheStore + ?Sized>(
+    bundles: &'a B,
+    cache: &C,
+    key: &'a str,
+    args: Option<&FluentArgs>,
+) -> Cow<'a, str> {
+    let lang_guard = get_lang();
+    let current_key = &lang_guard.key;
+
+    // 1. Current Language
+    if let Some(res) = resolve_entry(bundles, cache, current_key, key, args) {
+        return res;
+    }
+
+    // 2. Fallback Language
+    if current_key != FALLBACK_LANG_KEY
+        && let Some(res) = resolve_entry(bundles, cache, FALLBACK_LANG_KEY, key, args)
+    {
+        return res;
+    }
+
+    // 3. Miss
+    Cow::Borrowed(key)
+}
+
 /// Retrieves a localized message without arguments.
 ///
 /// This function attempts to return a `Cow::Borrowed` referencing static binary data
@@ -150,38 +232,7 @@ pub fn lookup_static<'a, B: BundleCollection + ?Sized, C: CacheStore + ?Sized>(
     cache: &C,
     key: &'a str,
 ) -> Cow<'a, str> {
-    let current_key = &get_lang().key;
-    let is_fallback = current_key == FALLBACK_LANG_KEY;
-
-    // CURRENT LANGUAGE
-    if let Some(entry) = cache.get_entry(current_key, key) {
-        match entry {
-            CacheEntry::Static(s) => return Cow::Borrowed(s),
-            CacheEntry::Dynamic => {
-                if let Some(b) = bundles.get_bundle(current_key)
-                    && let Some(val) = lookup_in_bundle(b, key)
-                {
-                    return val;
-                }
-            }
-        }
-    }
-
-    // FALLBACK LANGUAGE
-    if !is_fallback && let Some(entry) = cache.get_entry(FALLBACK_LANG_KEY, key) {
-        match entry {
-            CacheEntry::Static(s) => return Cow::Borrowed(s),
-            CacheEntry::Dynamic => {
-                if let Some(b) = bundles.get_bundle(FALLBACK_LANG_KEY)
-                    && let Some(val) = lookup_in_bundle(b, key)
-                {
-                    return val;
-                }
-            }
-        }
-    }
-
-    Cow::Borrowed(key)
+    lookup_core(bundles, cache, key, None)
 }
 
 /// Retrieves a localized message with arguments.
@@ -202,60 +253,7 @@ pub fn lookup_dynamic<'a, B: BundleCollection + ?Sized, C: CacheStore + ?Sized>(
     key: &'a str,
     args: &FluentArgs,
 ) -> Cow<'a, str> {
-    let current_key = &get_lang().key;
-    let is_fallback = current_key == FALLBACK_LANG_KEY;
-
-    // CURRENT LANGUAGE
-    if let Some(entry) = cache.get_entry(current_key, key) {
-        match entry {
-            // Even if args are provided, if it's static, ignore args and return static string (Zero alloc)
-            CacheEntry::Static(s) => return Cow::Borrowed(s),
-            CacheEntry::Dynamic => {
-                if let Some(b) = bundles.get_bundle(current_key)
-                    && let Some(val) = format_in_bundle(b, key, args)
-                {
-                    return val;
-                }
-            }
-        }
-    }
-
-    // FALLBACK LANGUAGE
-    if !is_fallback && let Some(entry) = cache.get_entry(FALLBACK_LANG_KEY, key) {
-        match entry {
-            CacheEntry::Static(s) => return Cow::Borrowed(s),
-            CacheEntry::Dynamic => {
-                if let Some(b) = bundles.get_bundle(FALLBACK_LANG_KEY)
-                    && let Some(val) = format_in_bundle(b, key, args)
-                {
-                    return val;
-                }
-            }
-        }
-    }
-
-    Cow::Borrowed(key)
-}
-
-fn lookup_in_bundle<'a>(
-    bundle: &'a ConcurrentFluentBundle<FluentResource>,
-    key: &str,
-) -> Option<Cow<'a, str>> {
-    let msg = bundle.get_message(key)?;
-    let pattern = msg.value()?;
-    let mut errors = vec![];
-    Some(bundle.format_pattern(pattern, None, &mut errors))
-}
-
-fn format_in_bundle<'a>(
-    bundle: &'a ConcurrentFluentBundle<FluentResource>,
-    key: &str,
-    args: &FluentArgs,
-) -> Option<Cow<'a, str>> {
-    let msg = bundle.get_message(key)?;
-    let pattern = msg.value()?;
-    let mut errors = vec![];
-    Some(bundle.format_pattern(pattern, Some(args), &mut errors))
+    lookup_core(bundles, cache, key, Some(args))
 }
 
 /// The primary accessor macro for localized strings.
@@ -277,6 +275,7 @@ fn format_in_bundle<'a>(
 ///     "unread_count" => 5
 /// });
 /// ```
+#[allow(clippy::crate_in_macro_def)]
 #[macro_export]
 macro_rules! t {
     ($key:expr) => {
