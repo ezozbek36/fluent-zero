@@ -1,3 +1,9 @@
+# Changelog
+
+## v0.1.3
+
+New `FluentZeroBuilder` API for generating charset, allowing easy font subsetting.
+
 ## v0.1.2
 
 Small, miscellaneous documentation improvements and fixes.
