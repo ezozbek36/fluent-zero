@@ -280,8 +280,8 @@ pub fn lookup_dynamic<'a, B: BundleCollection + ?Sized, C: CacheStore + ?Sized>(
 macro_rules! t {
     ($key:expr) => {
         $crate::lookup_static(
-            &crate::LOCALES,
-            &crate::CACHE,
+            &LOCALES,
+            &CACHE,
             $key
         )
     };
@@ -290,8 +290,8 @@ macro_rules! t {
             let mut args = $crate::FluentArgs::new();
             $( args.set($k, $v); )*
             $crate::lookup_dynamic(
-                &crate::LOCALES,
-                &crate::CACHE,
+                &LOCALES,
+                &CACHE,
                 $key,
                 &args
             )
